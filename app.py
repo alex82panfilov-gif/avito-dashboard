@@ -1,4 +1,4 @@
-# app.py (Финальная версия с обработкой NaT и infinity)
+# app.py (Финальная версия с жесткой типизацией данных)
 
 import streamlit as st
 import pandas as pd
@@ -14,17 +14,22 @@ SUPABASE_TABLE_NAME = "monitoring_data"
 # --- АУТЕНТИФИКАЦИЯ (без изменений) ---
 def check_password():
     def password_entered():
-        if st.session_state["password"] == st.secrets["PASSWORD"]:
-            st.session_state["password_correct"] = True; del st.session_state["password"]
-        else: st.session_state["password_correct"] = False
-    if "password_correct" not in st.session_state: st.session_state["password_correct"] = False
+        if "password" in st.session_state and st.session_state["password"] == st.secrets["PASSWORD"]:
+            st.session_state["password_correct"] = True
+            del st.session_state["password"]
+        else:
+            st.session_state["password_correct"] = False
+    if "password_correct" not in st.session_state:
+        st.session_state["password_correct"] = False
     if not st.session_state["password_correct"]:
         st.text_input("Пароль", type="password", on_change=password_entered, key="password")
-        if st.session_state.get("password_correct") is False: st.error("😕 Неверный пароль.")
+        if st.session_state.get("password_correct") is False:
+            st.error("😕 Неверный пароль.")
         return False
-    else: return True
+    else:
+        return True
 
-# --- ФУНКЦИИ ДЛЯ РАБОТЫ С SUPABASE (без изменений) ---
+# --- ФУНКЦИИ ДЛЯ РАБОТЫ С SUPABASE ---
 @st.cache_resource
 def init_supabase_client():
     url = st.secrets["SUPABASE_URL"]
@@ -46,16 +51,15 @@ def load_data_from_supabase(client: Client):
 
 def save_data_to_supabase(client: Client, df: pd.DataFrame):
     client.table(SUPABASE_TABLE_NAME).delete().neq('id', 0).execute()
-    # Конвертируем DataFrame в список словарей, заменяя NaN/NaT на None
     data_to_insert = df.replace({np.nan: None, pd.NaT: None}).to_dict(orient='records')
-    # Форматируем даты в строки для JSON
     for row in data_to_insert:
+        for key, value in row.items():
+            if pd.isna(value):
+                row[key] = None
         if row.get('Старт'): row['Старт'] = row['Старт'].strftime('%Y-%m-%d')
         if row.get('Окончание'): row['Окончание'] = row['Окончание'].strftime('%Y-%m-%d')
-            
     client.table(SUPABASE_TABLE_NAME).insert(data_to_insert).execute()
     st.success("Данные успешно сохранены в базе!")
-
 
 def clear_data_in_supabase(client: Client):
     client.table(SUPABASE_TABLE_NAME).delete().neq('id', 0).execute()
@@ -68,67 +72,77 @@ def to_excel(df):
         df.to_excel(writer, index=False, sheet_name='Data')
     return output.getvalue()
 
-# <<< ИЗМЕНЕНИЕ: Добавлена очистка от несовместимых с JSON типов данных >>>
+# <<< ИЗМЕНЕНИЕ: Самая строгая и полная очистка и типизация данных >>>
 def process_uploaded_file(uploaded_file):
-    xls = pd.ExcelFile(uploaded_file)
-    target_sheet_names = [name for name in xls.sheet_names if name.startswith("План vs Факт_")]
-    if not target_sheet_names:
-        st.error("В файле не найдено ни одного листа с названием 'План vs Факт_Месяц'.")
-        return None
-    
-    df = pd.concat(list(pd.read_excel(uploaded_file, sheet_name=target_sheet_names, header=3, usecols='B:N').values()), ignore_index=True)
-    df.dropna(subset=['Вертикаль', 'Кампания'], inplace=True)
-    
-    df['План'] = pd.to_numeric(df['План'], errors='coerce').fillna(0)
-    df['Факт'] = pd.to_numeric(df['Факт'], errors='coerce').fillna(0)
-    
-    # Расчет "Разницы"
-    df['Разница'] = np.where(df['План'] > 0, (df['Факт'] / df['План']) - 1, np.where(df['Факт'] > 0, 1, 0))
-    # Заменяем бесконечные значения (inf), если они вдруг появятся, на None
-    df.replace([np.inf, -np.inf], None, inplace=True)
+    try:
+        xls = pd.ExcelFile(uploaded_file)
+        target_sheet_names = [name for name in xls.sheet_names if name.startswith("План vs Факт_")]
+        if not target_sheet_names:
+            st.error("В файле не найдено ни одного листа с названием 'План vs Факт_Месяц'.")
+            return None
         
-    df = df[(df['План'] != 0) | (df['Факт'] != 0)]
-    
-    # Преобразуем в даты, создавая NaT для ошибок
-    for col in ['Старт', 'Окончание']:
-        df[col] = pd.to_datetime(df[col], errors='coerce')
+        df = pd.concat(list(pd.read_excel(uploaded_file, sheet_name=target_sheet_names, header=3, usecols='B:N').values()), ignore_index=True)
+        df.dropna(subset=['Вертикаль', 'Кампания'], how='all', inplace=True)
         
-    df['Подрядчик'] = df['Подрядчик'].astype(str).str.upper()
-    
-    final_columns = ['Вертикаль', 'Кампания', 'Тип', 'Город', 'Подрядчик', 'Месяц', 'Старт', 'Окончание', 'Единица', 'План', 'Факт', 'Разница', 'Комментарий']
-    for col in final_columns:
-        if col not in df.columns:
-            df[col] = None
-            if col in ['План', 'Факт', 'Разница']: df[col] = 0
+        # --- ШАГ 1: Создаем все нужные колонки, чтобы избежать ошибок ---
+        final_columns = ['Вертикаль', 'Кампания', 'Тип', 'Город', 'Подрядчик', 'Месяц', 'Старт', 'Окончание', 'Единица', 'План', 'Факт', 'Разница', 'Комментарий']
+        for col in final_columns:
+            if col not in df.columns:
+                df[col] = None
 
-    return df[final_columns]
+        # --- ШАГ 2: Жесткая типизация колонок в соответствии с базой данных ---
+        # Текстовые колонки: приводим к строке, заменяя пустые значения на None
+        for col in ['Вертикаль', 'Кампания', 'Тип', 'Город', 'Подрядчик', 'Месяц', 'Единица', 'Комментарий']:
+            df[col] = df[col].astype(str).replace('nan', None)
+
+        # Числовые колонки: приводим к числу, ошибки заменяем на 0, затем приводим к нужному типу
+        df['План'] = pd.to_numeric(df['План'], errors='coerce').fillna(0).astype('int64')
+        df['Факт'] = pd.to_numeric(df['Факт'], errors='coerce').fillna(0).astype('int64')
+
+        # Рассчитываем "Разницу"
+        df['Разница'] = np.where(df['План'] > 0, (df['Факт'] / df['План']) - 1, np.where(df['Факт'] > 0, 1, 0))
+        df['Разница'] = pd.to_numeric(df['Разница'], errors='coerce').fillna(0).astype('float64')
+
+        # Даты: приводим к дате, ошибки становятся NaT (Not a Time)
+        for col in ['Старт', 'Окончание']:
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+            
+        # --- ШАГ 3: Финальная очистка и возврат DataFrame в правильном порядке ---
+        df = df[final_columns]
+        df.replace([np.inf, -np.inf], None, inplace=True)
+        df.dropna(subset=['Вертикаль', 'Кампания'], how='all', inplace=True)
+
+        return df
+    except Exception as e:
+        st.error(f"Произошла критическая ошибка при обработке Excel-файла: {e}")
+        return None
 
 # =============================================================================
 # --- ОСНОВНАЯ ЧАСТЬ ПРИЛОЖЕНИЯ (без изменений) ---
 # =============================================================================
 st.title("📊 Интерактивный дашборд по мониторингу рекламы AVITO")
-
-if not check_password():
-    st.stop()
-
+if not check_password(): st.stop()
 supabase_client = init_supabase_client()
 df = load_data_from_supabase(supabase_client)
-
 if df.empty:
     st.info("База данных пуста. Загрузите отчет Excel для начала работы.")
     uploaded_file = st.file_uploader("Загрузите Excel-файл с отчетом", type=["xlsx", "xls"])
     if uploaded_file:
         with st.spinner("Обработка и сохранение данных..."):
             new_df = process_uploaded_file(uploaded_file)
-            if new_df is not None:
-                save_data_to_supabase(supabase_client, new_df)
-                st.rerun()
+            if new_df is not None and not new_df.empty:
+                try:
+                    save_data_to_supabase(supabase_client, new_df)
+                    st.rerun()
+                except Exception as e:
+                    st.error("Ошибка при сохранении данных в базу. Проверьте логи.")
+                    st.exception(e)
+            elif new_df is not None and new_df.empty:
+                 st.warning("В файле не найдено данных для загрузки после очистки.")
 else:
     st.sidebar.header("Фильтры:")
     if st.sidebar.button("🗑️ Очистить и загрузить новый отчет"):
-        clear_data_in_supabase(supabase_client)
-        st.rerun()
-    
+        clear_data_in_supabase(supabase_client); st.rerun()
     df['Вертикаль'] = df['Вертикаль'].astype(str); df['Тип'] = df['Тип'].astype(str); df['Город'] = df['Город'].astype(str)
     vertical = st.sidebar.multiselect("Вертикаль:", options=sorted(df["Вертикаль"].unique()), default=sorted(df["Вертикаль"].unique()))
     supplier = st.sidebar.multiselect("Подрядчик (Supplier):", options=sorted(df["Подрядчик"].unique()), default=sorted(df["Подрядчик"].unique()))
