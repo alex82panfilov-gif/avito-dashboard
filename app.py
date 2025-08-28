@@ -1,10 +1,10 @@
-# app.py (Исправлена ошибка вставки данных в Supabase)
+# app.py (Финальная версия с обработкой NaT и infinity)
 
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 import io
-import numpy as np # <-- Добавляем numpy для более удобных расчетов
+import numpy as np
 from supabase import create_client, Client
 
 # --- НАСТРОЙКИ ---
@@ -46,12 +46,16 @@ def load_data_from_supabase(client: Client):
 
 def save_data_to_supabase(client: Client, df: pd.DataFrame):
     client.table(SUPABASE_TABLE_NAME).delete().neq('id', 0).execute()
-    df_copy = df.copy()
-    for col in ['Старт', 'Окончание']:
-        df_copy[col] = pd.to_datetime(df_copy[col]).dt.strftime('%Y-%m-%d')
-    data_to_insert = df_copy.to_dict(orient='records')
+    # Конвертируем DataFrame в список словарей, заменяя NaN/NaT на None
+    data_to_insert = df.replace({np.nan: None, pd.NaT: None}).to_dict(orient='records')
+    # Форматируем даты в строки для JSON
+    for row in data_to_insert:
+        if row.get('Старт'): row['Старт'] = row['Старт'].strftime('%Y-%m-%d')
+        if row.get('Окончание'): row['Окончание'] = row['Окончание'].strftime('%Y-%m-%d')
+            
     client.table(SUPABASE_TABLE_NAME).insert(data_to_insert).execute()
     st.success("Данные успешно сохранены в базе!")
+
 
 def clear_data_in_supabase(client: Client):
     client.table(SUPABASE_TABLE_NAME).delete().neq('id', 0).execute()
@@ -64,7 +68,7 @@ def to_excel(df):
         df.to_excel(writer, index=False, sheet_name='Data')
     return output.getvalue()
 
-# <<< ИЗМЕНЕНИЕ: Функция process_uploaded_file теперь рассчитывает столбец "Разница" >>>
+# <<< ИЗМЕНЕНИЕ: Добавлена очистка от несовместимых с JSON типов данных >>>
 def process_uploaded_file(uploaded_file):
     xls = pd.ExcelFile(uploaded_file)
     target_sheet_names = [name for name in xls.sheet_names if name.startswith("План vs Факт_")]
@@ -75,40 +79,29 @@ def process_uploaded_file(uploaded_file):
     df = pd.concat(list(pd.read_excel(uploaded_file, sheet_name=target_sheet_names, header=3, usecols='B:N').values()), ignore_index=True)
     df.dropna(subset=['Вертикаль', 'Кампания'], inplace=True)
     
-    # Преобразуем План и Факт в числа, заменяя ошибки на 0
     df['План'] = pd.to_numeric(df['План'], errors='coerce').fillna(0)
     df['Факт'] = pd.to_numeric(df['Факт'], errors='coerce').fillna(0)
     
-    # Рассчитываем Разницу с защитой от деления на ноль
-    # Условие: если План > 0, считаем по формуле. Иначе, если Факт > 0, разница 1 (100%), иначе 0.
-    df['Разница'] = np.where(
-        df['План'] > 0, 
-        (df['Факт'] / df['План']) - 1, 
-        np.where(df['Факт'] > 0, 1, 0)
-    )
-    
+    # Расчет "Разницы"
+    df['Разница'] = np.where(df['План'] > 0, (df['Факт'] / df['План']) - 1, np.where(df['Факт'] > 0, 1, 0))
+    # Заменяем бесконечные значения (inf), если они вдруг появятся, на None
+    df.replace([np.inf, -np.inf], None, inplace=True)
+        
     df = df[(df['План'] != 0) | (df['Факт'] != 0)]
     
+    # Преобразуем в даты, создавая NaT для ошибок
     for col in ['Старт', 'Окончание']:
-        df[col] = pd.to_datetime(df[col], errors='coerce').dt.date
+        df[col] = pd.to_datetime(df[col], errors='coerce')
         
     df['Подрядчик'] = df['Подрядчик'].astype(str).str.upper()
     
-    # Убедимся, что все столбцы существуют и имеют правильный порядок
-    # (на случай, если в Excel их порядок изменится)
-    final_columns = [
-        'Вертикаль', 'Кампания', 'Тип', 'Город', 'Подрядчик', 'Месяц', 
-        'Старт', 'Окончание', 'Единица', 'План', 'Факт', 'Разница', 'Комментарий'
-    ]
-    # Добавляем недостающие колонки (если есть) и заполняем их пустыми значениями
+    final_columns = ['Вертикаль', 'Кампания', 'Тип', 'Город', 'Подрядчик', 'Месяц', 'Старт', 'Окончание', 'Единица', 'План', 'Факт', 'Разница', 'Комментарий']
     for col in final_columns:
         if col not in df.columns:
-            df[col] = None # Для текста/дат
-            if col in ['План', 'Факт', 'Разница']:
-                df[col] = 0 # Для чисел
+            df[col] = None
+            if col in ['План', 'Факт', 'Разница']: df[col] = 0
 
-    return df[final_columns] # Возвращаем df с правильным порядком столбцов
-
+    return df[final_columns]
 
 # =============================================================================
 # --- ОСНОВНАЯ ЧАСТЬ ПРИЛОЖЕНИЯ (без изменений) ---
