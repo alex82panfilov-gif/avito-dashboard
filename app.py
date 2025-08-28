@@ -1,10 +1,11 @@
-# app.py (Финальная версия с интеграцией Supabase)
+# app.py (Исправлена ошибка вставки данных в Supabase)
 
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 import io
-from supabase import create_client, Client # <<< НОВОЕ: Импорт для Supabase
+import numpy as np # <-- Добавляем numpy для более удобных расчетов
+from supabase import create_client, Client
 
 # --- НАСТРОЙКИ ---
 st.set_page_config(page_title="Дашборд по мониторингу рекламы", page_icon="📊", layout="wide")
@@ -23,26 +24,20 @@ def check_password():
         return False
     else: return True
 
-# --- ФУНКЦИИ ДЛЯ РАБОТЫ С SUPABASE ---
+# --- ФУНКЦИИ ДЛЯ РАБОТЫ С SUPABASE (без изменений) ---
 @st.cache_resource
 def init_supabase_client():
-    """Инициализирует и возвращает клиент Supabase."""
     url = st.secrets["SUPABASE_URL"]
     key = st.secrets["SUPABASE_KEY"]
     return create_client(url, key)
 
 def load_data_from_supabase(client: Client):
-    """Загружает все данные из таблицы Supabase."""
     try:
         response = client.table(SUPABASE_TABLE_NAME).select("*").execute()
         df = pd.DataFrame(response.data)
-        if df.empty:
-            return df
-        # Удаляем служебные столбцы, если они есть
+        if df.empty: return df
         df = df.drop(columns=['id', 'created_at'], errors='ignore')
-        # Преобразуем даты обратно в datetime объекты
-        date_cols = ['Старт', 'Окончание']
-        for col in date_cols:
+        for col in ['Старт', 'Окончание']:
             df[col] = pd.to_datetime(df[col], errors='coerce').dt.date
         return df
     except Exception as e:
@@ -50,54 +45,79 @@ def load_data_from_supabase(client: Client):
         return pd.DataFrame()
 
 def save_data_to_supabase(client: Client, df: pd.DataFrame):
-    """Полностью очищает таблицу и сохраняет новый DataFrame."""
-    # 1. Очищаем старые данные
-    client.table(SUPABASE_TABLE_NAME).delete().neq('id', 0).execute() # neq('id', 0) - трюк для удаления всех строк
-    # 2. Подготавливаем и вставляем новые данные
+    client.table(SUPABASE_TABLE_NAME).delete().neq('id', 0).execute()
     df_copy = df.copy()
-    # Конвертируем даты в строки для надежной записи через API
     for col in ['Старт', 'Окончание']:
         df_copy[col] = pd.to_datetime(df_copy[col]).dt.strftime('%Y-%m-%d')
-    
     data_to_insert = df_copy.to_dict(orient='records')
     client.table(SUPABASE_TABLE_NAME).insert(data_to_insert).execute()
     st.success("Данные успешно сохранены в базе!")
 
 def clear_data_in_supabase(client: Client):
-    """Очищает все данные в таблице."""
     client.table(SUPABASE_TABLE_NAME).delete().neq('id', 0).execute()
     st.info("Данные очищены. Можете загрузить новый файл.")
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (без изменений) ---
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def to_excel(df):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df.to_excel(writer, index=False, sheet_name='Data')
     return output.getvalue()
 
+# <<< ИЗМЕНЕНИЕ: Функция process_uploaded_file теперь рассчитывает столбец "Разница" >>>
 def process_uploaded_file(uploaded_file):
     xls = pd.ExcelFile(uploaded_file)
     target_sheet_names = [name for name in xls.sheet_names if name.startswith("План vs Факт_")]
     if not target_sheet_names:
         st.error("В файле не найдено ни одного листа с названием 'План vs Факт_Месяц'.")
         return None
+    
     df = pd.concat(list(pd.read_excel(uploaded_file, sheet_name=target_sheet_names, header=3, usecols='B:N').values()), ignore_index=True)
     df.dropna(subset=['Вертикаль', 'Кампания'], inplace=True)
-    numeric_cols = ['План', 'Факт']; [df.__setitem__(col, pd.to_numeric(df[col], errors='coerce')) for col in numeric_cols]
-    df.fillna(0, inplace=True); df = df[(df['План'] != 0) | (df['Факт'] != 0)]
-    date_cols = ['Старт', 'Окончание']; [df.__setitem__(col, pd.to_datetime(df[col], errors='coerce').dt.date) for col in date_cols]
+    
+    # Преобразуем План и Факт в числа, заменяя ошибки на 0
+    df['План'] = pd.to_numeric(df['План'], errors='coerce').fillna(0)
+    df['Факт'] = pd.to_numeric(df['Факт'], errors='coerce').fillna(0)
+    
+    # Рассчитываем Разницу с защитой от деления на ноль
+    # Условие: если План > 0, считаем по формуле. Иначе, если Факт > 0, разница 1 (100%), иначе 0.
+    df['Разница'] = np.where(
+        df['План'] > 0, 
+        (df['Факт'] / df['План']) - 1, 
+        np.where(df['Факт'] > 0, 1, 0)
+    )
+    
+    df = df[(df['План'] != 0) | (df['Факт'] != 0)]
+    
+    for col in ['Старт', 'Окончание']:
+        df[col] = pd.to_datetime(df[col], errors='coerce').dt.date
+        
     df['Подрядчик'] = df['Подрядчик'].astype(str).str.upper()
-    return df
+    
+    # Убедимся, что все столбцы существуют и имеют правильный порядок
+    # (на случай, если в Excel их порядок изменится)
+    final_columns = [
+        'Вертикаль', 'Кампания', 'Тип', 'Город', 'Подрядчик', 'Месяц', 
+        'Старт', 'Окончание', 'Единица', 'План', 'Факт', 'Разница', 'Комментарий'
+    ]
+    # Добавляем недостающие колонки (если есть) и заполняем их пустыми значениями
+    for col in final_columns:
+        if col not in df.columns:
+            df[col] = None # Для текста/дат
+            if col in ['План', 'Факт', 'Разница']:
+                df[col] = 0 # Для чисел
+
+    return df[final_columns] # Возвращаем df с правильным порядком столбцов
+
 
 # =============================================================================
-# --- ОСНОВНАЯ ЧАСТЬ ПРИЛОЖЕНИЯ ---
+# --- ОСНОВНАЯ ЧАСТЬ ПРИЛОЖЕНИЯ (без изменений) ---
 # =============================================================================
 st.title("📊 Интерактивный дашборд по мониторингу рекламы AVITO")
 
 if not check_password():
     st.stop()
 
-# Подключаемся к Supabase
 supabase_client = init_supabase_client()
 df = load_data_from_supabase(supabase_client)
 
@@ -116,16 +136,12 @@ else:
         clear_data_in_supabase(supabase_client)
         st.rerun()
     
-    # --- БОКОВАЯ ПАНЕЛЬ С ФИЛЬТРАМИ (без изменений) ---
     df['Вертикаль'] = df['Вертикаль'].astype(str); df['Тип'] = df['Тип'].astype(str); df['Город'] = df['Город'].astype(str)
     vertical = st.sidebar.multiselect("Вертикаль:", options=sorted(df["Вертикаль"].unique()), default=sorted(df["Вертикаль"].unique()))
     supplier = st.sidebar.multiselect("Подрядчик (Supplier):", options=sorted(df["Подрядчик"].unique()), default=sorted(df["Подрядчик"].unique()))
     media_type = st.sidebar.multiselect("Тип медиа:", options=sorted(df["Тип"].unique()), default=sorted(df["Тип"].unique()))
     city = st.sidebar.multiselect("Город:", options=sorted(df["Город"].unique()), default=sorted(df["Город"].unique()))
-    
     df_selection = df.query("Вертикаль == @vertical & Подрядчик == @supplier & Тип == @media_type & Город == @city")
-
-    # --- ОСНОВНАЯ ПАНЕЛЬ ДАШБОРДА (без изменений) ---
     total_plan = int(df_selection["План"].sum())
     total_fact = int(df_selection["Факт"].sum())
     if total_plan > 0: difference = (total_fact / total_plan) - 1
